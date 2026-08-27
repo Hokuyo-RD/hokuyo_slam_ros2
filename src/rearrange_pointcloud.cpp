@@ -25,6 +25,8 @@
 #include <sstream> 
 #include <cmath>   
 #include <iomanip> 
+#include <cstring>
+#include <cctype>
 
 #include <pcl/common/transforms.h>
 #include <pcl/io/pcd_io.h>
@@ -42,12 +44,52 @@ double calculate_distance_2d(double x1, double y1, double x2, double y2) {
     return std::sqrt(std::pow(x1 - x2, 2) + std::pow(y1 - y2, 2));
 }
 
+// ----------------------------------------------------------------------
+// ヘルパー関数: 2つの (x, y, z) 座標間の距離を計算
+// ----------------------------------------------------------------------
+double calculate_distance_3d(double x1, double y1, double z1,
+                             double x2, double y2, double z2) {
+    return std::sqrt(std::pow(x1 - x2, 2) + std::pow(y1 - y2, 2) + std::pow(z1 - z2, 2));
+}
+
+// ----------------------------------------------------------------------
+// ヘルパー関数: 引数を実数として安全に読み取る
+//
+// std::stod は変換に失敗すると例外を投げ、捕捉しないとプログラムが
+// 異常終了 (abort) する。利用者にとって原因が分からない終わり方に
+// なるため、ここで捕捉して分かりやすいメッセージを出す。
+// ----------------------------------------------------------------------
+bool parse_positive_double(const char *arg, const char *name, double &out) {
+    try {
+        size_t idx = 0;
+        double v = std::stod(arg, &idx);
+        // 数値の後ろにゴミが付いている場合 (例: "1.0m") も誤りとして扱う
+        while (idx < std::strlen(arg) && std::isspace(static_cast<unsigned char>(arg[idx]))) ++idx;
+        if (idx != std::strlen(arg)) {
+            std::cerr << "エラー: " << name << " に数値として読めない値が指定されました: '"
+                      << arg << "'" << std::endl;
+            return false;
+        }
+        if (!std::isfinite(v) || v < 0.0) {
+            std::cerr << "エラー: " << name << " には 0 以上の数値を指定してください: '"
+                      << arg << "'" << std::endl;
+            return false;
+        }
+        out = v;
+        return true;
+    } catch (const std::exception &) {
+        std::cerr << "エラー: " << name << " に数値として読めない値が指定されました: '"
+                  << arg << "'" << std::endl;
+        return false;
+    }
+}
+
 int main(int argc, char *argv[]) {
     // ----------------------------------------------------------------------
     // 1. 引数の確認と初期設定
     // ----------------------------------------------------------------------
     if (argc < 4) { 
-        std::cerr << "使用法: " << argv[0] << " <ログファイル名> <PCD出力ファイル名のベース> <JSON出力ファイル名> [点群結合間隔(行)] [Waypoint設置間隔(m)]" << std::endl;
+        std::cerr << "使用法: " << argv[0] << " <ログファイル名> <PCD出力ファイル名のベース> <JSON出力ファイル名> [点群結合間隔(m)] [Waypoint設置間隔(m)]" << std::endl;
         return 1;
     }
 
@@ -67,15 +109,26 @@ int main(int argc, char *argv[]) {
     std::string outjson_name = argv[3]; 
 
     // 引数から間隔設定を読み込み (指定がない場合はデフォルト値を使用)
-    int merge_interval = 1;      // デフォルト: 10行
-    double min_distance_m = 4.0;  // デフォルト: 4.0m
+    //
+    // pc_save_distance / min_distance_m はいずれも「距離 [m]」である。
+    // lio_raw (src/pcd_tf_extractor.py) と意味をそろえてあるため、
+    // 0.3 のような 1 未満の小数を指定して密な地図を作ることができる。
+    double pc_save_distance = 1.0;  // デフォルト: 1.0m (点群を足し込む間隔)
+    double min_distance_m = 4.0;    // デフォルト: 4.0m (Waypoint を置く間隔)
 
     if (argc >= 5) {
-        merge_interval = std::stoi(argv[4]);
+        if (!parse_positive_double(argv[4], "点群結合間隔 (pc_save_distance)", pc_save_distance)) {
+            return 1;
+        }
     }
     if (argc >= 6) {
-        min_distance_m = std::stod(argv[5]);
+        if (!parse_positive_double(argv[5], "Waypoint設置間隔 (wp_save_distance)", min_distance_m)) {
+            return 1;
+        }
     }
+
+    std::cout << "  PointCloud Distance Filter: " << pc_save_distance << " m" << std::endl;
+    std::cout << "  Waypoint Distance Filter: " << min_distance_m << " m" << std::endl;
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr merged_cloud(new pcl::PointCloud<pcl::PointXYZ>);
     
@@ -89,14 +142,20 @@ int main(int argc, char *argv[]) {
 
     int cnt = 0;
 
+    // 点群の距離フィルタ用 (最初の 1 枚は必ず保存する)
+    bool has_last_pcd = false;
+    double last_pcd_x = 0.0, last_pcd_y = 0.0, last_pcd_z = 0.0;
+    int saved_cloud_count = 0;
+
     // ----------------------------------------------------------------------
     // 2. メインループ: 点群の結合と Waypoint の抽出
+    //
+    // 点群と Waypoint は、それぞれ独立した距離フィルタで間引く。
+    // (lio_raw と同じ考え方)
     // ----------------------------------------------------------------------
     while (std::getline(file, line)) {
         ++cnt;
-        // 指定された行数おきに処理を行う
-        if (cnt % merge_interval != 0) continue; 
-        
+
         std::istringstream iss(line);
         std::string filename;
         float x, y, z, qx, qy, qz, qw, rx, ry, rz;
@@ -109,27 +168,47 @@ int main(int argc, char *argv[]) {
         }
 
         // ------------------------------------------------------------------
-        // A. PCD結合処理 
+        // A. PCD結合処理 (距離フィルタ)
+        //
+        // 前回足し込んだ位置から pc_save_distance [m] 以上離れたときだけ
+        // 点群を読み込んで結合する。0 を指定した場合はすべて結合する。
         // ------------------------------------------------------------------
-        Eigen::Quaterniond quaternion(qw, qx, qy, qz);
-        Eigen::Translation3d translation(x, y, z);
-        Eigen::Affine3d transform = translation * quaternion;
+        double cur_x = static_cast<double>(x);
+        double cur_y = static_cast<double>(y);
+        double cur_z = static_cast<double>(z);
 
-        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
-        if (pcl::io::loadPCDFile<pcl::PointXYZ>(filename, *cloud) == -1) {
-            std::cerr << "ERROR: Couldn't read file " << filename << std::endl;
-            continue;
+        bool save_this_cloud =
+            !has_last_pcd ||
+            calculate_distance_3d(cur_x, cur_y, cur_z,
+                                  last_pcd_x, last_pcd_y, last_pcd_z) >= pc_save_distance;
+
+        if (save_this_cloud) {
+            Eigen::Quaterniond quaternion(qw, qx, qy, qz);
+            Eigen::Translation3d translation(x, y, z);
+            Eigen::Affine3d transform = translation * quaternion;
+
+            pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+            if (pcl::io::loadPCDFile<pcl::PointXYZ>(filename, *cloud) == -1) {
+                std::cerr << "ERROR: Couldn't read file " << filename << std::endl;
+                continue;
+            }
+
+            pcl::transformPointCloud(*cloud, *cloud, transform);
+            *merged_cloud += *cloud;
+
+            has_last_pcd = true;
+            last_pcd_x = cur_x;
+            last_pcd_y = cur_y;
+            last_pcd_z = cur_z;
+            ++saved_cloud_count;
         }
-
-        pcl::transformPointCloud(*cloud, *cloud, transform);
-        *merged_cloud += *cloud;
 
         // ------------------------------------------------------------------
         // B. Waypoint 抽出処理
         // ------------------------------------------------------------------
-        double current_x = static_cast<double>(x);
-        double current_y = static_cast<double>(y);
-        
+        double current_x = cur_x;
+        double current_y = cur_y;
+
         if (waypoints_list.empty() || 
             calculate_distance_2d(current_x, current_y, last_wp_x, last_wp_y) >= min_distance_m) 
         {
@@ -170,6 +249,16 @@ int main(int argc, char *argv[]) {
     // ----------------------------------------------------------------------
 
     // PCDファイルの保存
+    std::cout << "結合した点群: " << saved_cloud_count << " 枚 / " << cnt << " 枚中"
+              << " (合計 " << merged_cloud->size() << " 点)" << std::endl;
+
+    if (merged_cloud->empty()) {
+        std::cerr << "エラー: 結合された点群が空です。地図は作成できません。" << std::endl;
+        std::cerr << "       concat.txt の内容と、点群 (PCD) ファイルの有無を確認してください。"
+                  << std::endl;
+        return 1;
+    }
+
     pcl::io::savePCDFileASCII(outpcd_name, *merged_cloud);
     std::cout << "PCDファイルを保存しました: " << outpcd_name << std::endl;
 
